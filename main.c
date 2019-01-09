@@ -7,13 +7,11 @@
 #include <openssl/md5.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <errno.h>
 
-//#define DEFAULT_PATH "/mnt/c/Users/Chris/Documents/test/dupe_finder"
+#include "main.h"
+#include "hashmap.h"
 
-
-int file_md5(unsigned char* digest, char md5_buf[64], size_t buffsize, const char* path);
-
-const char* ignore_subdirs[] = {".", "..", "data"}; // files to ignore
 
 
 int main(int argc, char* argv[])
@@ -26,6 +24,11 @@ int main(int argc, char* argv[])
     DIR*  subdir;
     struct dirent* dirfile;
     struct dirent* subfile;
+    struct folderhash_param fdp;
+    struct hashmap_map *hashmap;
+
+    hashmap = hashmap_new();
+    fdp.hashmap = hashmap;
 
 
     if (argc == 1) { // if no path was specified, just use the one specified in the #define
@@ -42,9 +45,9 @@ int main(int argc, char* argv[])
         return -1;
     }
 
+    errno = 0;
     while ((dirfile = readdir(maindir)) != NULL) {
-        // TODO: Rewrite to avoid using chdir(2)
-        chdir(scan_path); // would it be faster to use fchdir(2) instead? probably, but not noticeably.
+        errno = 0;
         if (dirfile->d_type == DT_DIR) { // not a dir?
             if (strcmp(dirfile->d_name, ".") == 0 || strcpy(dirfile->d_name, "..") == 0)
                 continue; // not the droids I'm looking for
@@ -52,22 +55,31 @@ int main(int argc, char* argv[])
             if ((subdir = opendir(dirfile->d_name)) == NULL) {
                 perror("Failed to open subdir");
                 /// @Hmmm: How should this handle errors here?
+            } else {
+                fdp.dir = dirfile;
+                hash_folder(&fdp);
             }
 
-            chdir(dirfile->d_name);
+
+
+
+            /*chdir(dirfile->d_name);
             while ((subfile = readdir(subdir)) != NULL) {
                 if (subfile->d_type == DT_REG) {
                     printf("File name :%s\n", subfile->d_name);
-                    // how the fuck am I going to store such a massive amount of files.
-                    /// @Hmmm: Hashmaps?
+
                 } else {
                     // For this program, it should just ignore anything not a file.
                 }
-            }
+            }*/
         } else if (dirfile->d_type == DT_REG) {
             // ignore this I guess?
         }
 
+    }
+    if (errno != 0) {
+        perror("Error occured when reading subfiles of dir");
+        return -1;
     }
 
 
@@ -81,10 +93,16 @@ int main(int argc, char* argv[])
 // TODO: Use hashmaps (crc32?) to store md5 hash with crc32
 void* hash_folder (void* param) // uses void* because pthread.
 {
-    struct dirent* dirfile = (struct dirent*)param;
+    struct folderhash_param *fdp = param;
+    struct dirent* dirfile = fdp->dir;
     struct dirent* subfile;
+
     DIR* dir;
     int fd;
+
+    MD5_CTX md5;
+    char md5buf[1024];
+    char digest[MD5_DIGEST_LENGTH];
 
     if ((fd = open(dirfile->d_name, O_RDONLY) == -1)) { // need dirfd for openat(2);
         perror("Failed to open directory"); // could use snprintf to format to buffer but whatever.
@@ -100,28 +118,52 @@ void* hash_folder (void* param) // uses void* because pthread.
 
     }
 
-    while (subfile = readdir())
+    while ((subfile = readdir(dir)) != 0) {
+        errno = 0;
+        if (subfile != NULL) {
+            if (subfile->d_type == DT_REG) {
+                if (file_md5(fd, (unsigned char *) &digest, md5buf, 1024, subfile->d_name, NULL) > -1) {
+                    hashmap_put(fdp->hashmap, subfile->d_name, digest);
+                } else {
+                    // some error occurred when hashing the file
+                }
+            } else {
+                // shouldn't be here, but ignore it.
+            }
+        } else {
+            perror("ERROR: error occured while reading directory");
+            printf("\t%s", dirfile->d_name);
+            return 0;
+            //pthread_exit(NULL);
+        }
+    }
 
-
-
+    return 0;
 }
 
 
-int file_md5 (unsigned char *digest, char *md5_buffer, size_t buffsize, const char* path) // md5 is good enough
+int file_md5(int dirfd, unsigned char *digest, char *md5_buffer,
+        size_t buffsize, const char *filename, MD5_CTX *md5ctx) // md5 is good enough
 {
     int fd;
-    MD5_CTX* md5 = 0;
     ssize_t bytes_read;
-    if ((fd = open(path, O_RDONLY)) == -1) {
+    errno = 0;
+    if ((fd = openat(dirfd, filename, O_RDONLY)) == NULL) {
         perror("ERROR: Failed to open file");
+        printf("\t\t%s", filename);
         return -1;
     }
 
-    MD5_Init(md5);
+    MD5_Init(md5ctx);
 
-    while((bytes_read = read(fd, md5_buffer, buffsize)) > 0)
-        MD5_Update(md5, md5_buffer, (size_t)bytes_read);
-    MD5_Final(digest,md5);
+    while((bytes_read = read(fd, md5_buffer, buffsize)) > 0) // 0 bytes returned on EOF, NULL returned on error
+        MD5_Update(md5ctx, md5_buffer, (size_t)bytes_read);
+    if (errno != 0) {
+        perror("ERROR: error occurred when reading from file: ");
+        printf("\t\t%s", filename);
+        return -1;
+    }
+    MD5_Final(digest,md5ctx);
 
     close(fd);
     return 0;
